@@ -62,6 +62,16 @@ func setSocketPath(_ addr: inout sockaddr_un, _ path: String) {
     }
 }
 
+/// A disconnected or wedged client must not kill the daemon with SIGPIPE or
+/// block the app's control queue indefinitely.
+func configureSocket(_ fd: Int32, timeout: Int) {
+    var enabled: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout.size(ofValue: enabled)))
+    var interval = timeval(tv_sec: timeout, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &interval, socklen_t(MemoryLayout.size(ofValue: interval)))
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &interval, socklen_t(MemoryLayout.size(ofValue: interval)))
+}
+
 // MARK: - Errors
 
 public enum DaemonError: Error, CustomStringConvertible {
@@ -91,6 +101,7 @@ public final class DaemonClient {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
+        configureSocket(fd, timeout: 15)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -139,8 +150,14 @@ public final class DaemonClient {
         return try JSONDecoder().decode(ThermalStatus.self, from: data)
     }
 
-    public func setAll(rpm: Float) throws { _ = try send("set \(Int(rpm))") }
-    public func setFan(_ index: Int, rpm: Float) throws { _ = try send("setfan \(index) \(Int(rpm))") }
+    public func setAll(rpm: Float) throws {
+        guard rpm.isFinite, rpm >= 0 else { throw MacFanError.invalidValue("Invalid RPM") }
+        _ = try send("set \(rpm)")
+    }
+    public func setFan(_ index: Int, rpm: Float) throws {
+        guard rpm.isFinite, rpm >= 0 else { throw MacFanError.invalidValue("Invalid RPM") }
+        _ = try send("setfan \(index) \(rpm)")
+    }
     public func auto() throws { _ = try send("auto") }
     public func autoFan(_ index: Int) throws { _ = try send("autofan \(index)") }
     public func max() throws { _ = try send("max") }

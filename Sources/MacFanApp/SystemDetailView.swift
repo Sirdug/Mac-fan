@@ -197,13 +197,15 @@ struct SystemDetailView: View {
     }
 
     private func coreCard(_ core: CPUCoreMetric) -> some View {
-        let color: Color = core.cluster == "Super" ? .orange : .yellow
+        let cluster = state.performanceSnapshot?.perCoreClusters?["\(core.id)"] ?? core.cluster
+        let kind = CPUClusterKind(clusterName: cluster)
+        let color: Color = kind == .efficiency ? .green : (kind == .superCore ? .orange : .yellow)
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("CORE \(core.id)")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
                 Spacer()
-                Text(core.cluster == "Super" ? "S" : "P")
+                Text(kind.badge)
                     .font(.system(size: 8, weight: .heavy, design: .rounded))
                     .foregroundStyle(color)
             }
@@ -220,7 +222,7 @@ struct SystemDetailView: View {
         .padding(9)
         .background(color.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 10))
-        .help("\(core.cluster) core \(core.id)")
+        .help("\(cluster) core \(core.id)")
     }
 
     // MARK: - GPU
@@ -361,8 +363,11 @@ struct SystemDetailView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(color)
                 }
-                MiniGraph(values: history, color: color, fixedMaximum: 1)
-                    .frame(height: compact ? 58 : 78)
+                MiniGraph(
+                    values: history, color: color, fixedMaximum: 1,
+                    capacity: state.historyLimit, style: .detailed
+                )
+                .frame(height: compact ? 72 : 94)
             }
         }
         .padding(compact ? 12 : 16)
@@ -394,9 +399,9 @@ struct SystemDetailView: View {
                 Image(systemName: "info.circle.fill")
                     .foregroundStyle(.blue)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Calibrated GPU and rail telemetry needs the updated helper")
+                    Text("Detailed telemetry is unavailable")
                         .font(.system(size: 11, weight: .semibold))
-                    Text("Run ./setup.sh once; CPU and memory readings already use the corrected local samplers.")
+                    Text(state.performanceError ?? "This macOS version did not provide GPU frequency and power readings.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
@@ -446,10 +451,10 @@ struct SystemDetailView: View {
 
     private func coreClock(_ core: CPUCoreMetric) -> String {
         if let mhz = state.performanceSnapshot?.perCoreMHz["\(core.id)"] { return frequency(mhz) }
-        guard let clusters = state.performanceSnapshot?.clusterMHz, !clusters.isEmpty else { return "Clock —" }
-        let values = clusters.values.sorted()
-        let mhz = core.cluster == "Super" ? values.last! : values.first!
-        return frequency(mhz)
+        guard let snapshot = state.performanceSnapshot,
+              let name = snapshot.perCoreClusters?["\(core.id)"],
+              let mhz = snapshot.clusterMHz[name] else { return "Clock —" }
+        return "≈" + frequency(mhz)
     }
 
     private var gpuClock: String {

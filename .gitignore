@@ -5,3 +5,5 @@
 .vscode/
 *.xcuserstate
 xcuserdata/
+build/
+Scripts/release.env

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Mac Fan</string>
+	<key>CFBundleExecutable</key>
+	<string>MacFanApp</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.macfan.app</string>
+	<key>CFBundleName</key>
+	<string>Mac Fan</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.2</string>
+	<key>CFBundleVersion</key>
+	<string>3</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>UpdateFeedURL</key>
+	<string>https://github.com/Sirdug/Mac-fan/releases/latest/download/update.json</string>
+	<key>UpdatePublicKey</key>
+	<string>AnN0jjeGbsweYaftCGJBoJnU2h/e45kXX2jhiIRdtlM=</string>
+</dict>
+</plist>

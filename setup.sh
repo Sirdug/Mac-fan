@@ -10,70 +10,29 @@
 set -e
 cd "$(dirname "$0")"
 
-# Prefer a full Xcode toolchain for SwiftUI macro support. The standalone
-# Command Line Tools included with macOS beta releases can lack SwiftUIMacros.
-if [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
-    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
-elif [ -d "/Applications/Xcode-beta.app/Contents/Developer" ]; then
-    export DEVELOPER_DIR="/Applications/Xcode-beta.app/Contents/Developer"
+if [ "$(uname -m)" != "arm64" ]; then
+    echo "Mac Fan requires an Apple Silicon Mac. Run this installer outside Rosetta."
+    exit 1
+fi
+if [ "$(sw_vers -productVersion | cut -d. -f1)" -lt 26 ]; then
+    echo "Mac Fan requires macOS 26 or newer, including on M1 Pro MacBook Pro."
+    exit 1
 fi
 
 echo "Building Mac Fan (release)..."
-swift build -c release --quiet
-
-# App icon
-if [ ! -f MacFan.icns ]; then
-    echo "Generating app icon..."
-    swift Scripts/generate-icon.swift
-    iconutil -c icns MacFan.iconset -o MacFan.icns
-    rm -rf MacFan.iconset
-fi
+CONFIG=release Scripts/build-app.sh
+BUILT="build/Mac Fan.app"
 
 echo "Installing daemon (requires admin password once)..."
 pkill -x MacFanApp 2>/dev/null || true
-sudo xattr -cr .build/release/macfan 2>/dev/null || true
-sudo .build/release/macfan install
+sudo "$BUILT/Contents/Resources/macfan" install
 
-# Create the .app bundle in /Applications
-APP_DIR="/Applications/Mac Fan.app/Contents"
-sudo mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources"
-sudo cp .build/release/MacFanApp "$APP_DIR/MacOS/MacFanApp"
-sudo cp MacFan.icns "$APP_DIR/Resources/AppIcon.icns"
-
-sudo tee "$APP_DIR/Info.plist" > /dev/null << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>Mac Fan</string>
-    <key>CFBundleDisplayName</key>
-    <string>Mac Fan</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.macfan.app</string>
-    <key>CFBundleVersion</key>
-    <string>1.0.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-    <key>CFBundleExecutable</key>
-    <string>MacFanApp</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>26.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-
+# Copy the app bundle into /Applications. It carries the fan helper and the
+# update settings, so later versions arrive through the app's own updater.
+sudo rm -rf "/Applications/Mac Fan.app"
+sudo ditto "$BUILT" "/Applications/Mac Fan.app"
 sudo xattr -cr "/Applications/Mac Fan.app"
-# Bundle owned by the user so future app updates don't need sudo
+# Bundle owned by the user so the in-app updater can replace it without sudo
 sudo chown -R "$USER" "/Applications/Mac Fan.app"
 sudo mdimport "/Applications/Mac Fan.app" 2>/dev/null || true
 

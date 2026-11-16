@@ -66,7 +66,8 @@ public enum SensorSource: Codable, Equatable, Hashable {
 
 public enum SensorCatalog {
 
-    /// flt-type temperature keys (4 bytes) known across M1-M5.
+    /// Temperature keys known across M1-M5. Their actual types are probed;
+    /// battery and proximity sensors can use sp78 instead of flt.
     /// Keys that don't exist on a given machine are skipped when probing.
     public static let floatKeys: [String] = [
         // CPU — aggregate
@@ -89,7 +90,7 @@ public enum SensorCatalog {
         // Proximity
         "TS0P",
         // Battery
-        "TB0T",
+        "TB0T", "TB1T", "TB2T",
     ]
 
     /// ioft-type keys (16.16 fixed-point, 8 bytes) — GPU temps on the M5 family.

@@ -21,6 +21,7 @@ final class AppState: ObservableObject {
     @Published var status: ThermalStatus?
     @Published var daemonUp = false
     @Published var failsafe = false
+    @Published private(set) var controlError: String?
     @Published var profiles: [Profile] = Profile.loadAll()
     @Published var rotation: Double = 0
     @Published private(set) var systemMetrics = SystemMetrics()
@@ -82,11 +83,21 @@ final class AppState: ObservableObject {
 
     /// Set by the app delegate — opens the curve editor window.
     var openCurveEditor: (() -> Void)?
+
+    /// In-app updates from the GitHub releases feed.
+    let updates = UpdateService()
+    /// Installs or updates the root fan daemon from the copy inside the app.
+    let fanHelper = FanHelper()
     // MARK: - Private
 
     private let client = DaemonClient()
     private let systemMonitor = SystemMonitor()
     private let ioQueue = DispatchQueue(label: "com.macfan.io")
+    private let monitorQueue = DispatchQueue(label: "com.macfan.monitor")
+    private var fanPollInFlight = false
+    /// A change arrived while a poll was running; poll again as soon as it ends.
+    private var repollRequested = false
+    private var remoteControl: RemoteControl?
     private var engines: [CurveEngine] = []
     private var controlTimer: Timer?
     private var monitorTimer: Timer?
@@ -116,9 +127,10 @@ final class AppState: ObservableObject {
         }
         controlTimer?.tolerance = 0.3
         pollFans()
+        remoteControl = RemoteControl(state: self)
 
         // Establish the first CPU counter baseline before the panel opens.
-        ioQueue.async { [weak self] in _ = self?.systemMonitor.sample() }
+        monitorQueue.async { [weak self] in _ = self?.systemMonitor.sample() }
     }
 
     // MARK: - Derived
@@ -147,7 +159,18 @@ final class AppState: ObservableObject {
 
     // MARK: - Fan-control poll (fixed cadence)
 
+    /// Applies the active profile now instead of on the next 2-second tick.
+    func applyNow() {
+        if fanPollInFlight {
+            repollRequested = true
+        } else {
+            pollFans()
+        }
+    }
+
     private func pollFans() {
+        guard !fanPollInFlight else { return }
+        fanPollInFlight = true
         let profile = activeProfile
         let engines = self.engines
 
@@ -159,8 +182,12 @@ final class AppState: ObservableObject {
                 status = try self.client.status()
             } catch {
                 DispatchQueue.main.async {
+                    self.fanPollInFlight = false
+                    self.repollRequested = false
                     self.daemonUp = false
                     self.status = nil
+                    self.controlError = "\(error)"
+                    self.updateSpinTimer()
                 }
                 return
             }
@@ -169,53 +196,66 @@ final class AppState: ObservableObject {
             let hottest = temps.values.max() ?? 0
             let curveTemp = profile.sensorSource.resolve(in: temps) ?? hottest
             var failsafe = false
+            var controlError: String?
 
-            // App-side failsafe mirror (daemon enforces it independently)
-            if hottest >= ThermalSafety.failsafeTemp {
-                failsafe = true
-                try? self.client.max()
-            } else {
-                for fan in status.fans {
-                    let cfg = profile.config(for: fan.index)
-                    let action: FanAction
-                    switch cfg.mode {
-                    case .auto:
-                        action = .auto
-                    case .fixed:
-                        var rpm = cfg.fixedRPM
-                        if fan.minRPM > 0 { rpm = max(rpm, fan.minRPM) }
-                        if fan.maxRPM > 0 { rpm = min(rpm, fan.maxRPM) }
-                        action = .rpm(rpm)
-                    case .curve:
-                        if fan.index < engines.count {
-                            action = engines[fan.index].tick(
-                                temp: curveTemp, minRPM: fan.minRPM, maxRPM: fan.maxRPM)
-                        } else {
+            do {
+                if temps.isEmpty {
+                    try self.client.auto()
+                    throw MacFanError.readFailed("temperature sensors; fans returned to Apple control")
+                }
+
+                // App-side failsafe mirror (daemon enforces it independently)
+                if hottest >= ThermalSafety.failsafeTemp {
+                    failsafe = true
+                    try self.client.max()
+                } else {
+                    for fan in status.fans {
+                        let cfg = profile.config(for: fan.index)
+                        let action: FanAction
+                        switch cfg.mode {
+                        case .auto:
                             action = .auto
+                        case .fixed:
+                            var rpm = cfg.fixedRPM
+                            if fan.minRPM > 0 { rpm = max(rpm, fan.minRPM) }
+                            if fan.maxRPM > 0 { rpm = min(rpm, fan.maxRPM) }
+                            action = .rpm(rpm)
+                        case .curve:
+                            if fan.index < engines.count {
+                                action = engines[fan.index].tick(
+                                    temp: curveTemp, minRPM: fan.minRPM, maxRPM: fan.maxRPM)
+                            } else {
+                                action = .auto
+                            }
                         }
-                    }
 
-                    // Only send when the daemon's state actually needs to change
-                    switch action {
-                    case .auto:
-                        if fan.mode == "manual" {
-                            try? self.client.autoFan(fan.index)
-                        }
-                    case .rpm(let rpm):
-                        if fan.mode != "manual" || abs(fan.targetRPM - rpm) > 25 {
-                            try? self.client.setFan(fan.index, rpm: rpm)
+                        // Only send when the daemon's state actually needs to change
+                        switch action {
+                        case .auto:
+                            if fan.mode == "manual" {
+                                try self.client.autoFan(fan.index)
+                            }
+                        case .rpm(let rpm):
+                            if fan.mode != "manual" || abs(fan.targetRPM - rpm) > 25 {
+                                try self.client.setFan(fan.index, rpm: rpm)
+                            }
                         }
                     }
                 }
-            }
 
-            // Heartbeat keeps the daemon's watchdog at bay — only needed
-            // while some fan is actually under manual control
-            if status.fans.contains(where: { $0.mode == "manual" }) {
-                try? self.client.heartbeat()
+                // Heartbeat keeps the daemon's watchdog at bay — only needed
+                // while some fan is actually under manual control
+                if status.fans.contains(where: { $0.mode == "manual" }) {
+                    try self.client.heartbeat()
+                }
+
+            } catch {
+                controlError = "\(error)"
             }
 
             DispatchQueue.main.async {
+                self.fanPollInFlight = false
+                self.controlError = controlError
                 self.daemonUp = true
                 self.status = status
                 self.failsafe = failsafe
@@ -223,6 +263,10 @@ final class AppState: ObservableObject {
                     self.rebuildEngines(resetState: true)
                 }
                 self.updateSpinTimer()
+                if self.repollRequested {
+                    self.repollRequested = false
+                    self.pollFans()
+                }
             }
         }
     }
@@ -253,7 +297,7 @@ final class AppState: ObservableObject {
     private func pollMonitoring() {
         guard monitoringActive, !monitorPollInFlight else { return }
         monitorPollInFlight = true
-        ioQueue.async { [weak self] in
+        monitorQueue.async { [weak self] in
             guard let self else { return }
             var metrics = self.systemMonitor.sample()
             var snapshot: PerformanceSnapshot?
@@ -265,11 +309,10 @@ final class AppState: ObservableObject {
                     metrics.gpuUsage = gpuUsage
                     metrics.gpuUsageIsEstimated = false
                 }
-                // Whole-Mac battery telemetry should never be lower than the
-                // simultaneously measured CPU+GPU+ANE rail estimate.
+                // Rail estimates cover a different sampling window. Keep them
+                // separate instead of inflating the whole-system sensor value.
                 if let chipPower = snapshot?.combinedPowerW {
                     metrics.chipPowerW = chipPower
-                    metrics.systemPowerW = max(metrics.systemPowerW ?? 0, chipPower)
                 }
             } catch {
                 performanceError = "\(error)"
@@ -290,7 +333,11 @@ final class AppState: ObservableObject {
         append(metrics.cpuUsage, to: &cpuHistory)
         append(metrics.gpuUsage, to: &gpuHistory)
         append(metrics.memoryUsage, to: &memoryHistory)
-        append(metrics.systemPowerW ?? 0, to: &powerHistory)
+        if let power = metrics.systemPowerW {
+            append(power, to: &powerHistory)
+        } else {
+            powerHistory.removeAll()
+        }
     }
 
     private func append(_ value: Double, to history: inout [Double]) {
@@ -301,7 +348,8 @@ final class AppState: ObservableObject {
         }
     }
 
-    private var historyLimit: Int {
+    /// Samples kept per history: 60 seconds at the current update interval.
+    var historyLimit: Int {
         max(2, Int(ceil(60 / monitoringInterval)) + 1)
     }
 

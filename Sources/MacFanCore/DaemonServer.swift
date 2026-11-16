@@ -9,7 +9,7 @@
 //  Safety layers (independent of the app):
 //    - Heartbeat watchdog: fans manual + no app ping for 15 s -> back to auto
 //    - Thermal failsafe: any sensor >= 95 °C -> max fans until it cools
-//    - Sleep/wake: re-applies the last manual settings after wake
+//    - Wake: returns to Apple auto until the app reapplies its live profile
 //    - SIGTERM: resets fans to auto before exiting
 //
 
@@ -19,6 +19,9 @@ import IOKit.pwr_mgt
 
 public final class DaemonServer {
     private let socketFD: Int32
+    private let socketPath: String
+    private let performanceLock = NSLock()
+    private let clientSlots = DispatchSemaphore(value: 4)
     private let fanControl: FanControl
     /// Serializes all SMC access across client handler / watchdog / wake
     private let smcLock = NSLock()
@@ -28,22 +31,28 @@ public final class DaemonServer {
     private var manualFans: [Int: Float] = [:]
     private var lastHeartbeat: Date?
     private var failsafeActive = false
+    private var resetPending = false
     private let stateLock = NSLock()
 
     private var sigtermSource: DispatchSourceSignal?
 
-    public init(fanControl: FanControl) throws {
+    public convenience init(fanControl: FanControl) throws {
+        try self.init(fanControl: fanControl, socketPath: MacFanDaemon.socketPath)
+    }
+
+    init(fanControl: FanControl, socketPath: String) throws {
+        self.socketPath = socketPath
         self.fanControl = fanControl
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw MacFanError.smcConnectionFailed }
         self.socketFD = fd
 
-        unlink(MacFanDaemon.socketPath)
+        unlink(socketPath)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        setSocketPath(&addr, MacFanDaemon.socketPath)
+        setSocketPath(&addr, socketPath)
 
         let bindResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -56,7 +65,7 @@ public final class DaemonServer {
         }
 
         // Allow all local users to connect
-        chmod(MacFanDaemon.socketPath, 0o777)
+        chmod(socketPath, 0o777)
 
         guard listen(fd, 5) == 0 else {
             close(fd)
@@ -66,7 +75,7 @@ public final class DaemonServer {
 
     /// Run the server loop (blocks forever)
     public func run() {
-        NSLog("macfan daemon: listening on %@", MacFanDaemon.socketPath)
+        NSLog("macfan daemon: listening on %@", socketPath)
 
         registerWakeNotification()
         registerSigterm()
@@ -74,10 +83,14 @@ public final class DaemonServer {
 
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
+                clientSlots.wait()
                 let clientFD = accept(socketFD, nil, nil)
-                guard clientFD >= 0 else { continue }
-                handleClient(clientFD)
-                close(clientFD)
+                guard clientFD >= 0 else { clientSlots.signal(); continue }
+                DispatchQueue.global(qos: .utility).async { [self] in
+                    defer { clientSlots.signal() }
+                    handleClient(clientFD)
+                    close(clientFD)
+                }
             }
         }
 
@@ -87,71 +100,61 @@ public final class DaemonServer {
 
     // MARK: - Watchdog + Failsafe
 
-    /// Every 5 s: enforce the thermal failsafe and the heartbeat watchdog.
+    /// A one-second safety tick is independent of monitoring and client requests.
     private func startWatchdog() {
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
-                Thread.sleep(forTimeInterval: 5)
-
-                // --- Thermal failsafe ---
-                smcLock.lock()
-                let hottest = fanControl.readTemperatures().values.max() ?? 0
-                smcLock.unlock()
-
-                stateLock.lock()
-                let wasActive = failsafeActive
-                if hottest >= ThermalSafety.failsafeTemp { failsafeActive = true }
-                if failsafeActive && hottest < ThermalSafety.failsafeClearTemp { failsafeActive = false }
-                let isActive = failsafeActive
-                stateLock.unlock()
-
-                if isActive {
-                    NSLog("macfan daemon: FAILSAFE — hottest sensor %.1f°C, forcing max fans", hottest)
-                    smcLock.lock()
-                    try? fanControl.setMax()
-                    smcLock.unlock()
-                    continue
-                } else if wasActive {
-                    NSLog("macfan daemon: failsafe cleared (%.1f°C) — fans back to auto", hottest)
-                    smcLock.lock()
-                    try? fanControl.resetAuto()
-                    smcLock.unlock()
-                    stateLock.lock()
-                    manualFans = [:]
-                    lastHeartbeat = nil
-                    stateLock.unlock()
-                    continue
-                }
-
-                // --- Heartbeat watchdog ---
-                stateLock.lock()
-                let beat = lastHeartbeat
-                let hasManual = !manualFans.isEmpty
-                stateLock.unlock()
-
-                guard let lastBeat = beat, hasManual else { continue }
-
-                if Date().timeIntervalSince(lastBeat) > 15 {
-                    NSLog("macfan daemon: heartbeat timeout — resetting fans to auto")
-                    smcLock.lock()
-                    let resetSucceeded: Bool
-                    do {
-                        try fanControl.resetAuto()
-                        resetSucceeded = true
-                    } catch {
-                        NSLog("macfan daemon: watchdog reset failed: %@, will retry", "\(error)")
-                        resetSucceeded = false
-                    }
-                    smcLock.unlock()
-
-                    if resetSucceeded {
-                        stateLock.lock()
-                        manualFans = [:]
-                        lastHeartbeat = nil
-                        stateLock.unlock()
-                    }
-                }
+                Thread.sleep(forTimeInterval: 1)
+                watchdogTick()
             }
+        }
+    }
+
+    // All hardware and state transitions use the same lock order: SMC, state.
+    func watchdogTick(now: Date = Date()) {
+        smcLock.lock()
+        defer { smcLock.unlock() }
+        let hottest = fanControl.readTemperatures().values.max()
+        stateLock.lock()
+        let wasActive = failsafeActive
+        if let hottest {
+            if hottest >= ThermalSafety.failsafeTemp { failsafeActive = true }
+            if hottest < ThermalSafety.failsafeClearTemp { failsafeActive = false }
+        } else {
+            failsafeActive = false
+        }
+        let active = failsafeActive
+        let needsReset = resetPending
+        let timedOut = !manualFans.isEmpty && (lastHeartbeat.map { now.timeIntervalSince($0) >= 15 } ?? true)
+        stateLock.unlock()
+
+        if active {
+            do { try fanControl.setMax() }
+            catch {
+                NSLog("macfan daemon: failsafe fan write failed: %@", "\(error)")
+                resetTrackedFans()
+            }
+        } else if hottest == nil || wasActive || timedOut || needsReset {
+            // Missing sensors are not a temperature of zero. Return to Apple's
+            // thermal controller instead of holding a stale manual speed.
+            resetTrackedFans()
+        }
+    }
+
+    private func resetTrackedFans() {
+        do {
+            try fanControl.resetAuto()
+            stateLock.lock()
+            manualFans = [:]
+            lastHeartbeat = nil
+            resetPending = false
+            stateLock.unlock()
+        } catch {
+            NSLog("macfan daemon: auto reset failed: %@; will retry", "\(error)")
+            stateLock.lock()
+            // Keep the watchdog armed even after a partially failed command.
+            resetPending = true
+            stateLock.unlock()
         }
     }
 
@@ -165,7 +168,7 @@ public final class DaemonServer {
             smcLock.lock()
             try? fanControl.resetAuto()
             smcLock.unlock()
-            unlink(MacFanDaemon.socketPath)
+            unlink(socketPath)
             exit(0)
         }
         source.resume()
@@ -211,35 +214,18 @@ public final class DaemonServer {
         NSLog("macfan daemon: registered for wake notifications")
     }
 
-    private func handleWake() {
-        stateLock.lock()
-        let toApply = manualFans
-        stateLock.unlock()
-
-        guard !toApply.isEmpty else {
-            NSLog("macfan daemon: woke — nothing to re-apply")
-            return
-        }
-
-        NSLog("macfan daemon: woke — re-applying manual fan settings")
-
-        // Delay slightly — SMC needs a moment after wake
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) { [self] in
-            smcLock.lock()
-            defer { smcLock.unlock() }
-            for (index, rpm) in toApply {
-                do {
-                    try fanControl.setSpeed(fan: index, rpm: rpm)
-                } catch {
-                    NSLog("macfan daemon: wake re-apply fan %d failed: %@", index, "\(error)")
-                }
-            }
-        }
+    func handleWake() {
+        // Profiles will reapply on the next app poll. Never resurrect a captured
+        // manual setting after its owner has quit or switched back to Auto.
+        smcLock.lock()
+        defer { smcLock.unlock() }
+        resetTrackedFans()
     }
 
     // MARK: - Client Handling
 
     private func handleClient(_ fd: Int32) {
+        configureSocket(fd, timeout: 15)
         var buffer = [UInt8](repeating: 0, count: 256)
         let n = read(fd, &buffer, buffer.count - 1)
         guard n > 0 else { return }
@@ -255,7 +241,7 @@ public final class DaemonServer {
         }
     }
 
-    private func process(_ command: String) -> String {
+    func process(_ command: String) -> String {
         // powermetrics takes a short sample and must not hold the SMC lock;
         // fan polling and safety enforcement continue while it runs.
         if command == "performance" || command.hasPrefix("performance ") {
@@ -270,12 +256,12 @@ public final class DaemonServer {
             }
         }
 
+        smcLock.lock()
+        defer { smcLock.unlock() }
+
         stateLock.lock()
         let failsafe = failsafeActive
         stateLock.unlock()
-
-        smcLock.lock()
-        defer { smcLock.unlock() }
 
         let parts = command.split(separator: " ")
         do {
@@ -293,13 +279,15 @@ public final class DaemonServer {
 
             case "set":
                 guard !failsafe else { return "error: thermal failsafe active" }
-                guard parts.count >= 2, let rpm = Float(parts[1]) else {
+                guard parts.count >= 2, let rpm = Float(parts[1]), rpm.isFinite, rpm >= 0 else {
                     return "error: usage: set <rpm>"
                 }
                 let count = try fanControl.fanCount()
-                for i in 0..<count {
-                    try fanControl.setSpeed(fan: i, rpm: rpm)
+                guard !fanControl.readTemperatures().isEmpty else {
+                    resetTrackedFans()
+                    return "error: temperature sensors unavailable; fans returned to Apple control"
                 }
+                try fanControl.setAllFans(rpm: rpm)
                 stateLock.lock()
                 for i in 0..<count { manualFans[i] = rpm }
                 lastHeartbeat = Date()
@@ -308,11 +296,15 @@ public final class DaemonServer {
 
             case "setfan":
                 guard !failsafe else { return "error: thermal failsafe active" }
-                guard parts.count >= 3, let index = Int(parts[1]), let rpm = Float(parts[2]) else {
+                guard parts.count >= 3, let index = Int(parts[1]), let rpm = Float(parts[2]), rpm.isFinite, rpm >= 0 else {
                     return "error: usage: setfan <index> <rpm>"
                 }
                 guard index >= 0, index < (try fanControl.fanCount()) else {
                     return "error: no fan \(index)"
+                }
+                guard !fanControl.readTemperatures().isEmpty else {
+                    resetTrackedFans()
+                    return "error: temperature sensors unavailable; fans returned to Apple control"
                 }
                 try fanControl.setSpeed(fan: index, rpm: rpm)
                 stateLock.lock()
@@ -328,7 +320,7 @@ public final class DaemonServer {
                 stateLock.lock()
                 for i in 0..<count {
                     let info = try? fanControl.fanInfo(i)
-                    manualFans[i] = info.map { $0.maxRPM > 0 ? $0.maxRPM : 7826 } ?? 7826
+                    manualFans[i] = info?.maxRPM ?? 0
                 }
                 lastHeartbeat = Date()
                 stateLock.unlock()
@@ -348,6 +340,9 @@ public final class DaemonServer {
                 guard parts.count >= 2, let index = Int(parts[1]) else {
                     return "error: usage: autofan <index>"
                 }
+                guard index >= 0, index < (try fanControl.fanCount()) else {
+                    return "error: no fan \(index)"
+                }
                 try fanControl.resetAutoFan(index)
                 stateLock.lock()
                 manualFans.removeValue(forKey: index)
@@ -359,11 +354,16 @@ public final class DaemonServer {
                 return "error: unknown command '\(command)'"
             }
         } catch {
+            if ["set", "setfan", "max", "auto", "autofan"].contains(parts.first.map(String.init) ?? "") {
+                resetTrackedFans()
+            }
             return "error: \(error)"
         }
     }
 
     private func readPerformanceSnapshot(sampleMilliseconds: Int) throws -> PerformanceSnapshot {
+        guard performanceLock.try() else { throw DaemonError.commandFailed("Performance sampler is busy") }
+        defer { performanceLock.unlock() }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/powermetrics")
         process.arguments = [
@@ -375,15 +375,18 @@ public final class DaemonServer {
             "--handle-invalid-values",
         ]
         let outputPipe = Pipe()
-        let errorPipe = Pipe()
         process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        process.standardError = outputPipe
         try process.run()
+        let timeout = DispatchWorkItem {
+            if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: timeout)
+        defer { timeout.cancel() }
         let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
-            let message = String(data: errorData, encoding: .utf8) ?? "powermetrics failed"
+            let message = String(data: data, encoding: .utf8) ?? "powermetrics failed"
             throw DaemonError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return try PerformanceSnapshot.parsePowermetricsPlist(data)
@@ -391,6 +394,6 @@ public final class DaemonServer {
 
     deinit {
         close(socketFD)
-        unlink(MacFanDaemon.socketPath)
+        unlink(socketPath)
     }
 }

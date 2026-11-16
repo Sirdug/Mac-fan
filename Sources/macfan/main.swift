@@ -8,6 +8,7 @@
 //    sudo macfan uninstall   Stop + remove the daemon, reset fans to auto
 //    sudo macfan daemon      Run the daemon (invoked by launchd)
 //    macfan status           Show fans + temperatures
+//    macfan diagnose         Read-only hardware/telemetry compatibility report
 //    macfan set <rpm>        All fans to RPM
 //    macfan setfan <i> <rpm> One fan to RPM
 //    macfan auto             All fans back to Apple control
@@ -57,10 +58,16 @@ func install() {
 
     disableCompetingDaemons()
 
+    // Stop the old helper before resetting/copying so it cannot reapply a
+    // manual target while the installer is handing control back to Apple.
+    shell("launchctl bootout system/\(MacFanDaemon.label) 2>/dev/null")
+
     // Reset fans in case an old daemon left them in manual mode
-    if let fc = try? FanControl() {
-        try? fc.resetAuto()
+    do {
+        try FanControl().resetAuto()
         print("Fans reset to Apple auto control")
+    } catch {
+        fail("could not restore Apple fan control: \(error)")
     }
 
     // Copy this binary to the install path
@@ -78,9 +85,7 @@ func install() {
         print("Installed CLI: \(MacFanDaemon.installPath)")
     }
 
-    // Stop any previous daemon, write the plist, start
-    shell("launchctl bootout system/\(MacFanDaemon.label) 2>/dev/null")
-
+    // Write the plist and start the new helper.
     let plist = """
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -131,13 +136,15 @@ func uninstall() {
     requireRoot("uninstall")
 
     shell("launchctl bootout system/\(MacFanDaemon.label) 2>/dev/null")
+    do {
+        try FanControl().resetAuto()
+    } catch {
+        fail("could not restore Apple fan control; helper files retained for retry: \(error)")
+    }
     try? FileManager.default.removeItem(atPath: MacFanDaemon.plistPath)
     try? FileManager.default.removeItem(atPath: MacFanDaemon.installPath)
     unlink(MacFanDaemon.socketPath)
 
-    if let fc = try? FanControl() {
-        try? fc.resetAuto()
-    }
     print("Mac Fan daemon removed; fans back to Apple auto control.")
     print("(Note: previously disabled daemons — ThermalForge, fancontrold — stay disabled.)")
 }
@@ -175,6 +182,57 @@ func printStatus(_ status: ThermalStatus) {
     }
 }
 
+/// Safe to run on the target M1 Pro: does not issue any SMC writes and does not
+/// include serial numbers, hardware UUIDs, or other device identifiers.
+func diagnose() {
+    print("Mac Fan compatibility report (read-only)")
+    print("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+    for key in ["hw.model", "machdep.cpu.brand_string"] {
+        var size = 0
+        if sysctlbyname(key, nil, &size, nil, 0) == 0, size > 0 {
+            var bytes = [CChar](repeating: 0, count: size)
+            if sysctlbyname(key, &bytes, &size, nil, 0) == 0 {
+                print("\(key): \(String(cString: bytes))")
+            }
+        }
+    }
+    do {
+        let control = try FanControl()
+        let status = try control.status()
+        printStatus(status)
+        print("Readable temperature sensors: \(status.temperatures.count)")
+        let missing = SensorGroup.allCases.filter {
+            SensorSource.group($0).resolve(in: status.temperatures) == nil
+        }
+        if !missing.isEmpty {
+            print("Unavailable temperature groups: \(missing.map(\.displayName).joined(separator: ", "))")
+        }
+        if let smc = SMCConnection() {
+            for fan in status.fans {
+                let key = [SMCFanKey.modeUpper, SMCFanKey.modeLower]
+                    .map { SMCFanKey.key($0, fan: fan.index) }
+                    .first { smc.getKeyInfo($0)?.size == 1 }
+                print("Fan \(fan.index) mode key: \(key ?? "unavailable")")
+            }
+            print("Diagnostic unlock key: \(smc.getKeyInfo(SMCFanKey.forceTest) == nil ? "absent (direct control)" : "available if needed")")
+        }
+    } catch {
+        print("Direct hardware read unavailable: \(error)")
+    }
+    do {
+        let client = DaemonClient()
+        _ = try client.status()
+        print("Installed helper: reachable")
+        let metrics = try client.performance()
+        print("Detailed CPU clocks: \(metrics.perCoreMHz.count) cores, \(metrics.clusterMHz.count) clusters")
+        print("GPU frequency: \(metrics.gpuMHz.map { String(format: "%.0f MHz", $0) } ?? "unavailable")")
+        print("CPU / GPU / ANE power: \([metrics.cpuPowerW, metrics.gpuPowerW, metrics.anePowerW].map { $0.map { String(format: "%.2f W", $0) } ?? "unavailable" }.joined(separator: " / "))")
+    } catch {
+        print("Helper telemetry unavailable: \(error)")
+    }
+    print("Manual fan writes, physical RPM response, sleep/wake, and login launch require an on-device check.")
+}
+
 // MARK: - Main
 
 switch args.first {
@@ -195,6 +253,9 @@ case "uninstall":
 
 case "status", nil:
     printStatus()
+
+case "diagnose":
+    diagnose()
 
 case "performance":
     do {
@@ -220,5 +281,5 @@ case "max":
     do { try DaemonClient().max(); print("ok") } catch { fail("\(error)") }
 
 case let cmd?:
-    fail("unknown command '\(cmd)'. Commands: install, uninstall, daemon, status, performance, set, setfan, auto, max")
+    fail("unknown command '\(cmd)'. Commands: install, uninstall, daemon, status, diagnose, performance, set, setfan, auto, max")
 }

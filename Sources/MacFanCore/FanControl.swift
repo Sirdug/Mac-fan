@@ -16,6 +16,7 @@ public enum MacFanError: Error, CustomStringConvertible {
     case unlockFailed(String)
     case readFailed(String)
     case writeFailed(String)
+    case invalidValue(String)
 
     public var description: String {
         switch self {
@@ -25,8 +26,10 @@ public enum MacFanError: Error, CustomStringConvertible {
             return "Fan unlock failed: \(detail)"
         case .readFailed(let key):
             return "Failed to read SMC key: \(key)"
+        case .invalidValue(let detail):
+            return detail
         case .writeFailed(let key):
-            return "Failed to write SMC key: \(key). Run as root."
+            return "Failed to write or confirm SMC key: \(key)."
         }
     }
 }
@@ -63,240 +66,241 @@ public struct ThermalStatus: Codable, Equatable {
 // MARK: - Fan Control
 
 public final class FanControl {
-    private let smc: SMCConnection
-    /// Which mode key works on this hardware (detected at init)
-    private let modeKeyTemplate: String
-    /// Whether Ftst unlock is available (M1-M4) or not (M5+)
-    private let hasFtst: Bool
-    /// Sensor keys that exist on this machine — probed once, then only
-    /// these are read (absent keys otherwise cost IOKit calls every poll)
-    private var presentFloatKeys: [String]?
-    private var presentIoftKeys: [String]?
-    /// Hardware fan RPM limits are constants — read once per fan
+    private let smc: SMCIO
+    private let pause: (TimeInterval) -> Void
+    private var modeKeys: [Int: String] = [:]
+    private var presentSensors: [(key: String, type: String)]?
     private var cachedLimits: [Int: (min: Float, max: Float)] = [:]
 
-    public init() throws {
+    public convenience init() throws {
         guard let connection = SMCConnection() else {
             throw MacFanError.smcConnectionFailed
         }
-        self.smc = connection
-
-        // Detect hardware: M5 family uses F%dmd (lowercase), M1-M4 use F%dMd
-        let lowerResult = smc.readKey(SMCFanKey.key(SMCFanKey.modeLower, fan: 0))
-        self.modeKeyTemplate = lowerResult.success ? SMCFanKey.modeLower : SMCFanKey.modeUpper
-
-        // Ftst exists on M1-M4 only
-        if let info = smc.getKeyInfo(SMCFanKey.forceTest), info.size > 0 {
-            self.hasFtst = true
-        } else {
-            self.hasFtst = false
-        }
+        self.init(smc: connection)
     }
 
-    // MARK: - Read
+    // Injectable transport lets tests exercise M1 Pro firmware behavior without
+    // changing the fans on the computer running the test suite.
+    init(smc: SMCIO, pause: @escaping (TimeInterval) -> Void = Thread.sleep) {
+        self.smc = smc
+        self.pause = pause
+    }
 
     public func fanCount() throws -> Int {
         let result = smc.readKey(SMCFanKey.count)
-        guard result.success, !result.bytes.isEmpty else {
+        guard result.success, result.bytes.count == 1, result.bytes[0] <= 10 else {
             throw MacFanError.readFailed(SMCFanKey.count)
         }
         return Int(result.bytes[0])
     }
 
-    public func fanInfo(_ index: Int) throws -> FanInfo {
-        let actual = readFanFloat(index, template: SMCFanKey.actual)
-        let target = readFanFloat(index, template: SMCFanKey.target)
+    private func validateFan(_ index: Int) throws {
+        guard index >= 0, index < (try fanCount()) else {
+            throw MacFanError.invalidValue("No fan \(index)")
+        }
+    }
 
-        let minimum: Float
-        let maximum: Float
-        if let limits = cachedLimits[index] {
-            (minimum, maximum) = limits
-        } else {
-            minimum = readFanFloat(index, template: SMCFanKey.minimum)
-            maximum = readFanFloat(index, template: SMCFanKey.maximum)
-            if minimum > 0 || maximum > 0 {
-                cachedLimits[index] = (minimum, maximum)
+    private func modeKey(_ index: Int) throws -> String {
+        if let key = modeKeys[index] { return key }
+        for template in [SMCFanKey.modeLower, SMCFanKey.modeUpper] {
+            let key = SMCFanKey.key(template, fan: index)
+            if let info = smc.getKeyInfo(key), info.size == 1, info.type == "ui8 " {
+                let value = smc.readKey(key)
+                if value.success, value.bytes.count == 1 {
+                    modeKeys[index] = key
+                    return key
+                }
             }
         }
+        throw MacFanError.readFailed("fan \(index) mode (F\(index)Md/F\(index)md)")
+    }
 
-        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
-        let modeResult = smc.readKey(modeKey)
-        let modeValue = modeResult.success && !modeResult.bytes.isEmpty ? modeResult.bytes[0] : 0
+    private func modeValue(_ index: Int) throws -> UInt8 {
+        let key = try modeKey(index)
+        let result = smc.readKey(key)
+        guard result.success, result.bytes.count == 1 else { throw MacFanError.readFailed(key) }
+        return result.bytes[0]
+    }
+
+    public func fanInfo(_ index: Int) throws -> FanInfo {
+        try validateFan(index)
+        let actual = try readFanFloat(index, template: SMCFanKey.actual)
+        let target = try readFanFloat(index, template: SMCFanKey.target)
+        let limits: (min: Float, max: Float)
+        if let cached = cachedLimits[index] {
+            limits = cached
+        } else {
+            limits = (try readFanFloat(index, template: SMCFanKey.minimum),
+                      try readFanFloat(index, template: SMCFanKey.maximum))
+            guard limits.max > 0, limits.max >= limits.min else {
+                throw MacFanError.invalidValue("Invalid RPM limits for fan \(index)")
+            }
+            cachedLimits[index] = limits
+        }
+
+        let value = try modeValue(index)
         let mode: String
-        switch modeValue {
+        switch value {
         case 0: mode = "auto"
         case 1: mode = "manual"
         case 3: mode = "system"
-        default: mode = "unknown(\(modeValue))"
+        default: mode = "unknown(\(value))"
         }
-
-        return FanInfo(
-            index: index,
-            actualRPM: actual,
-            targetRPM: target,
-            minRPM: minimum,
-            maxRPM: maximum,
-            mode: mode
-        )
+        return FanInfo(index: index, actualRPM: actual, targetRPM: target,
+                       minRPM: limits.min, maxRPM: limits.max, mode: mode)
     }
 
-    // MARK: - Unlock
-
-    /// Put a single fan into manual mode.
-    /// On M1-M4 this first writes Ftst=1 (suppresses thermalmonitord),
-    /// then polls the mode key until the write sticks.
+    /// M1 Pro accepts a direct mode write. Use the global diagnostic unlock
+    /// only if firmware rejects that path, and verify every mode transition.
     private func unlockFan(_ index: Int) throws {
-        if hasFtst {
-            guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
-                throw MacFanError.unlockFailed("Failed to write Ftst=1. Run as root.")
-            }
-            Thread.sleep(forTimeInterval: 0.5)
+        let key = try modeKey(index)
+        if smc.writeKey(key, bytes: [1]), try modeValue(index) == 1 { return }
+
+        guard let info = smc.getKeyInfo(SMCFanKey.forceTest), info.size == 1,
+              info.type == "ui8 ", smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
+            throw MacFanError.unlockFailed("Fan \(index) rejected manual mode")
         }
-
-        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
-        let deadline = Date().addingTimeInterval(10.0)
-
-        while Date() < deadline {
-            if smc.writeKey(modeKey, bytes: [1]) {
-                return
-            }
-            Thread.sleep(forTimeInterval: 0.1)
+        // Bound the fallback so a failed unlock cannot starve safety checks.
+        for _ in 0..<50 {
+            pause(0.1)
+            if smc.writeKey(key, bytes: [1]), try modeValue(index) == 1 { return }
         }
-
-        throw MacFanError.unlockFailed("Timed out setting fan \(index) to manual mode. Run as root.")
+        throw MacFanError.unlockFailed("Timed out setting fan \(index) to manual mode")
     }
 
-    // MARK: - Set Speed
-
-    /// Set a single fan to a specific RPM (clamped to the hardware's min/max range).
     public func setSpeed(fan index: Int, rpm: Float) throws {
+        guard rpm.isFinite, rpm >= 0 else {
+            throw MacFanError.invalidValue("RPM must be a finite, nonnegative number")
+        }
         let info = try fanInfo(index)
-
-        var rpm = rpm
-        if info.minRPM > 0 { rpm = max(rpm, info.minRPM) }
-        if info.maxRPM > 0 { rpm = min(rpm, info.maxRPM) }
-
-        if info.mode != "manual" {
-            try unlockFan(index)
-        }
-
-        let targetKey = SMCFanKey.key(SMCFanKey.target, fan: index)
-        guard smc.writeKey(targetKey, bytes: floatToSMCBytes(rpm)) else {
-            throw MacFanError.writeFailed(targetKey)
+        let target = min(max(rpm, info.minRPM), info.maxRPM)
+        do {
+            if info.mode != "manual" { try unlockFan(index) }
+            let key = SMCFanKey.key(SMCFanKey.target, fan: index)
+            guard smc.writeKey(key, bytes: floatToSMCBytes(target)) else {
+                throw MacFanError.writeFailed(key)
+            }
+            try confirmTarget(target, fan: index)
+        } catch {
+            // Includes partial unlocks: never leave Ftst enabled after failure.
+            try? resetAuto()
+            throw error
         }
     }
 
-    /// Set all fans to a specific RPM.
+    /// M5 firmware acknowledges a target write before its readback updates
+    /// (about 200 ms on hardware). Wait at most one second without rewriting
+    /// the target; a persistent mismatch still triggers setSpeed's rollback.
+    private func confirmTarget(_ target: Float, fan index: Int) throws {
+        let key = SMCFanKey.key(SMCFanKey.target, fan: index)
+        for attempt in 0...10 {
+            let actualTarget = try readFanFloat(index, template: SMCFanKey.target)
+            guard try modeValue(index) == 1 else { throw MacFanError.writeFailed(key) }
+            if abs(actualTarget - target) <= 1 { return }
+            if attempt < 10 { pause(0.1) }
+        }
+        throw MacFanError.writeFailed(key)
+    }
+
     public func setAllFans(rpm: Float) throws {
-        for i in 0..<(try fanCount()) {
-            try setSpeed(fan: i, rpm: rpm)
+        do {
+            for i in 0..<(try fanCount()) { try setSpeed(fan: i, rpm: rpm) }
+        } catch {
+            try? resetAuto()
+            throw error
         }
     }
 
-    /// Set all fans to their maximum RPM.
     public func setMax() throws {
-        for i in 0..<(try fanCount()) {
-            let info = try fanInfo(i)
-            let maxRPM = info.maxRPM > 0 ? info.maxRPM : 7826
-            try setSpeed(fan: i, rpm: maxRPM)
+        do {
+            for i in 0..<(try fanCount()) {
+                try setSpeed(fan: i, rpm: fanInfo(i).maxRPM)
+            }
+        } catch {
+            try? resetAuto()
+            throw error
         }
     }
 
-    // MARK: - Reset
+    private func releaseFan(_ index: Int) throws {
+        let key = try modeKey(index)
+        // System mode (3) already belongs to Apple and may reject a mode write.
+        let value = try modeValue(index)
+        if value == 0 || value == 3 { return }
+        guard smc.writeKey(key, bytes: [0]) else { throw MacFanError.writeFailed(key) }
+        let after = try modeValue(index)
+        guard after == 0 || after == 3 else { throw MacFanError.writeFailed(key) }
+        // The target is ignored in auto mode. Do not write a zero target after
+        // releasing the fan: firmware may reject it once Apple owns the fan.
+    }
 
-    /// Return a single fan to Apple's automatic control.
-    /// Clears Ftst once no fan remains in manual mode.
+    private func clearUnlock() throws {
+        guard let info = smc.getKeyInfo(SMCFanKey.forceTest), info.size == 1 else { return }
+        let current = smc.readKey(SMCFanKey.forceTest)
+        if current.success, current.bytes == [0] { return }
+        guard smc.writeKey(SMCFanKey.forceTest, bytes: [0]) else {
+            throw MacFanError.writeFailed(SMCFanKey.forceTest)
+        }
+        let after = smc.readKey(SMCFanKey.forceTest)
+        guard after.success, after.bytes == [0] else {
+            throw MacFanError.writeFailed(SMCFanKey.forceTest)
+        }
+    }
+
     public func resetAutoFan(_ index: Int) throws {
-        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
-        _ = smc.writeKey(modeKey, bytes: [0])
-
-        let targetKey = SMCFanKey.key(SMCFanKey.target, fan: index)
-        _ = smc.writeKey(targetKey, bytes: floatToSMCBytes(0))
-
-        if hasFtst {
-            let count = (try? fanCount()) ?? 0
-            let anyManual = (0..<count).contains { i in
-                (try? fanInfo(i).mode) == "manual"
-            }
-            if !anyManual {
-                _ = smc.writeKey(SMCFanKey.forceTest, bytes: [0])
-            }
+        try validateFan(index)
+        try releaseFan(index)
+        // Do not release the global unlock while another fan needs it.
+        for i in 0..<(try fanCount()) {
+            if try modeValue(i) == 1 { return }
         }
+        try clearUnlock()
     }
 
-    /// Reset all fans to Apple defaults (auto mode, thermalmonitord resumes).
     public func resetAuto() throws {
-        let count = try fanCount()
-
-        for i in 0..<count {
-            let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            _ = smc.writeKey(modeKey, bytes: [0])
-
-            let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
-            _ = smc.writeKey(targetKey, bytes: floatToSMCBytes(0))
-        }
-
-        if hasFtst {
-            _ = smc.writeKey(SMCFanKey.forceTest, bytes: [0])
-        }
+        var firstError: Error?
+        do {
+            for i in 0..<(try fanCount()) {
+                do { try releaseFan(i) } catch { if firstError == nil { firstError = error } }
+            }
+        } catch { firstError = error }
+        // Even if one fan failed, resume Apple's thermal policy and attempt all
+        // releases. Report the failure so the daemon can retry next tick.
+        do { try clearUnlock() } catch { if firstError == nil { firstError = error } }
+        if let error = firstError { throw error }
     }
 
-    // MARK: - Status
-
-    /// Read current fan state and all available temperatures.
     public func status() throws -> ThermalStatus {
-        let count = try fanCount()
-        var fans: [FanInfo] = []
-        for i in 0..<count {
-            fans.append(try fanInfo(i))
-        }
+        let fans = try (0..<fanCount()).map { try fanInfo($0) }
         return ThermalStatus(fans: fans, temperatures: readTemperatures())
     }
 
-    /// Read all temperature sensors present on this machine.
-    /// The full catalog is probed exactly once; subsequent calls only touch
-    /// keys that actually exist.
     public func readTemperatures() -> [String: Float] {
-        if presentFloatKeys == nil {
-            presentFloatKeys = SensorCatalog.floatKeys.filter { key in
-                smc.getKeyInfo(key)?.size == 4
-            }
-            presentIoftKeys = SensorCatalog.ioftKeys.filter { key in
-                smc.getKeyInfo(key)?.size == 8
+        if presentSensors == nil || presentSensors?.isEmpty == true {
+            presentSensors = (SensorCatalog.floatKeys + SensorCatalog.ioftKeys).compactMap { key in
+                guard let info = smc.getKeyInfo(key),
+                      ["flt ", "sp78", "ioft"].contains(info.type) else { return nil }
+                return (key, info.type)
             }
         }
-
         var temps: [String: Float] = [:]
-
-        for key in presentFloatKeys ?? [] {
-            let result = smc.readKey(key)
-            if result.success && result.size == 4 {
-                let temp = smcBytesToFloat(result.bytes, size: result.size)
-                if temp > 0 && temp < 150 {
-                    temps[key] = (temp * 10).rounded() / 10
-                }
+        for sensor in presentSensors ?? [] {
+            let result = smc.readKey(sensor.key)
+            if result.success, let temp = smcNumber(result.bytes, type: sensor.type),
+               temp > 0, temp < 150 {
+                temps[sensor.key] = (temp * 10).rounded() / 10
             }
         }
-
-        for key in presentIoftKeys ?? [] {
-            let result = smc.readKey(key)
-            if result.success && result.size == 8 {
-                let temp = ioftBytesToFloat(result.bytes)
-                if temp > 0 && temp < 150 {
-                    temps[key] = (temp * 10).rounded() / 10
-                }
-            }
-        }
-
         return temps
     }
 
-    // MARK: - Private
-
-    private func readFanFloat(_ fan: Int, template: String) -> Float {
+    private func readFanFloat(_ fan: Int, template: String) throws -> Float {
         let key = SMCFanKey.key(template, fan: fan)
         let result = smc.readKey(key)
-        guard result.success else { return 0 }
-        return smcBytesToFloat(result.bytes, size: result.size)
+        guard let info = smc.getKeyInfo(key), info.type == "flt ",
+              result.success, let value = smcNumber(result.bytes, type: info.type), value >= 0 else {
+            throw MacFanError.readFailed(key)
+        }
+        return value
     }
 }

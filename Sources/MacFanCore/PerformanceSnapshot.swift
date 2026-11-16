@@ -11,6 +11,8 @@ import Foundation
 public struct PerformanceSnapshot: Codable, Equatable {
     public var clusterMHz: [String: Double]
     public var perCoreMHz: [String: Double]
+    /// Actual CPU IDs from powermetrics; perflevel order is not CPU-ID order.
+    public var perCoreClusters: [String: String]?
     public var gpuMHz: Double?
     public var cpuUsage: Double?
     public var gpuUsage: Double?
@@ -23,6 +25,7 @@ public struct PerformanceSnapshot: Codable, Equatable {
     public init(
         clusterMHz: [String: Double] = [:],
         perCoreMHz: [String: Double] = [:],
+        perCoreClusters: [String: String]? = nil,
         gpuMHz: Double? = nil,
         cpuUsage: Double? = nil,
         gpuUsage: Double? = nil,
@@ -34,6 +37,7 @@ public struct PerformanceSnapshot: Codable, Equatable {
     ) {
         self.clusterMHz = clusterMHz
         self.perCoreMHz = perCoreMHz
+        self.perCoreClusters = perCoreClusters
         self.gpuMHz = gpuMHz
         self.cpuUsage = cpuUsage
         self.gpuUsage = gpuUsage
@@ -48,14 +52,18 @@ public struct PerformanceSnapshot: Codable, Equatable {
     /// `powermetrics --format plist`. The last actual sample wins; the stream
     /// can also contain a hardware/header plist before its delta samples.
     public static func parsePowermetricsPlist(_ data: Data) throws -> PerformanceSnapshot {
-        let chunks = data.split(separator: 0, omittingEmptySubsequences: true).map(Data.init)
-        let candidates = chunks.isEmpty ? [data] : chunks
+        // A standalone binary plist contains embedded NULs and must be parsed
+        // intact. XML streams from powermetrics use NULs as sample separators.
+        let candidates = data.starts(with: Data("bplist".utf8)) ? [data]
+            : data.split(separator: 0, omittingEmptySubsequences: true).map(Data.init)
         var sample: [String: Any]?
 
         for chunk in candidates {
             guard let object = try? PropertyListSerialization.propertyList(
                 from: chunk, options: [], format: nil
             ), let dictionary = object as? [String: Any],
+               dictionary["invalid"] as? Bool != true,
+               dictionary["is_delta"] as? Bool != false,
                dictionary["processor"] != nil || dictionary["gpu"] != nil
             else { continue }
             sample = dictionary
@@ -67,21 +75,26 @@ public struct PerformanceSnapshot: Codable, Equatable {
 
         if let processor = sample["processor"] as? [String: Any] {
             snapshot.cpuPowerW = wattsFromMilliwatts(processor["cpu_power"])
+                ?? wattsFromEnergy(processor["cpu_energy"], elapsedNanoseconds: sample["elapsed_ns"])
             snapshot.gpuPowerW = wattsFromMilliwatts(processor["gpu_power"])
+                ?? wattsFromEnergy(processor["gpu_energy"], elapsedNanoseconds: sample["elapsed_ns"])
             snapshot.anePowerW = wattsFromMilliwatts(processor["ane_power"])
+                ?? wattsFromEnergy(processor["ane_energy"], elapsedNanoseconds: sample["elapsed_ns"])
             snapshot.combinedPowerW = wattsFromMilliwatts(processor["combined_power"])
 
             var coreUsages: [Double] = []
             if let clusters = processor["clusters"] as? [[String: Any]] {
                 for cluster in clusters {
                     let name = cluster["name"] as? String ?? "Cluster"
-                    if let hz = number(cluster["freq_hz"]), hz >= 0 {
+                    if let hz = number(cluster["freq_hz"]), hz.isFinite, hz >= 0 {
                         snapshot.clusterMHz[name] = hz / 1_000_000
                     }
                     if let cpus = cluster["cpus"] as? [[String: Any]] {
                         for cpu in cpus {
                             guard let id = integer(cpu["cpu"]) else { continue }
-                            if let hz = number(cpu["freq_hz"]), hz >= 0 {
+                            if snapshot.perCoreClusters == nil { snapshot.perCoreClusters = [:] }
+                            snapshot.perCoreClusters?["\(id)"] = name
+                            if let hz = number(cpu["freq_hz"]), hz.isFinite, hz >= 0 {
                                 snapshot.perCoreMHz["\(id)"] = hz / 1_000_000
                             }
                             if let idle = ratio(cpu["idle_ratio"]) {
@@ -97,8 +110,9 @@ public struct PerformanceSnapshot: Codable, Equatable {
         }
 
         if let gpu = sample["gpu"] as? [String: Any] {
-            if let hz = number(gpu["freq_hz"]), hz >= 0 {
-                snapshot.gpuMHz = hz / 1_000_000
+            if let hz = number(gpu["freq_hz"]), hz.isFinite, hz >= 0 {
+                // Older Apple Silicon releases report MHz despite the key name.
+                snapshot.gpuMHz = hz >= 1_000_000 ? hz / 1_000_000 : hz
             }
             if let idle = ratio(gpu["idle_ratio"]) {
                 snapshot.gpuUsage = 1 - idle
@@ -109,6 +123,11 @@ public struct PerformanceSnapshot: Codable, Equatable {
             }
         }
 
+        if snapshot.combinedPowerW == nil,
+           let cpu = snapshot.cpuPowerW, let gpu = snapshot.gpuPowerW,
+           let ane = snapshot.anePowerW {
+            snapshot.combinedPowerW = cpu + gpu + ane
+        }
         return snapshot
     }
 
@@ -131,13 +150,13 @@ public struct PerformanceSnapshot: Codable, Equatable {
         return milliwatts / 1_000
     }
 
-    /// `powermetrics` energy counters are nanojoules. This is only a fallback
-    /// for releases that omit the processor-level GPU power field.
+    /// Legacy Apple Silicon energy fields are millijoules per sample.
+    /// Divide by the actual duration, not an assumed one-second interval.
     private static func wattsFromEnergy(_ energy: Any?, elapsedNanoseconds: Any?) -> Double? {
-        guard let nanojoules = number(energy),
-              let nanoseconds = number(elapsedNanoseconds), nanoseconds > 0
+        guard let millijoules = number(energy), millijoules.isFinite, millijoules >= 0,
+              let nanoseconds = number(elapsedNanoseconds), nanoseconds.isFinite, nanoseconds > 0
         else { return nil }
-        return nanojoules / nanoseconds
+        return millijoules * 1_000_000 / nanoseconds
     }
 }
 

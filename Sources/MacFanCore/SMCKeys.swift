@@ -14,7 +14,7 @@ public enum SMCFanKey {
     /// Number of fans (uint8)
     public static let count = "FNum"
     /// Force test / diagnostic unlock flag (uint8: 0=off, 1=on)
-    /// NOTE: Does NOT exist on the M5 family. Present on M1-M4.
+    /// Optional diagnostic unlock. Probe at runtime; M1 Pro normally needs no unlock.
     public static let forceTest = "Ftst"
 
     // Templated keys — use key(_:fan:) to format with fan index
@@ -26,9 +26,9 @@ public enum SMCFanKey {
     public static let minimum = "F%dMn"
     /// Maximum RPM recommendation (flt)
     public static let maximum = "F%dMx"
-    /// Fan mode — lowercase on M5 family (ui8: 0=auto, 1=manual)
+    /// Fan mode — lowercase on some firmware (ui8: 0=auto, 1=manual)
     public static let modeLower = "F%dmd"
-    /// Fan mode — uppercase on M1-M4 (ui8: 0=auto, 1=manual, 3=system)
+    /// Fan mode — uppercase on M1 Pro (ui8: 0=auto, 1=manual, 3=system)
     public static let modeUpper = "F%dMd"
     /// Fan status (ui8, read-only: 3=system-controlled)
     public static let status = "F%dSt"
@@ -39,6 +39,24 @@ public enum SMCFanKey {
 }
 
 // MARK: - Data Conversion
+
+/// Decode according to the reported SMC type, never just the byte count.
+func smcNumber(_ bytes: [UInt8], type: String) -> Float? {
+    let value: Float
+    switch type {
+    case "flt " where bytes.count == 4:
+        value = smcBytesToFloat(bytes, size: 4)
+    case "ioft" where bytes.count == 8:
+        value = ioftBytesToFloat(bytes)
+    case "sp78" where bytes.count == 2:
+        value = Float(Int16(bitPattern: UInt16(bytes[0]) << 8 | UInt16(bytes[1]))) / 256
+    case "fpe2" where bytes.count == 2:
+        value = Float(UInt16(bytes[0]) << 8 | UInt16(bytes[1])) / 4
+    default:
+        return nil
+    }
+    return value.isFinite ? value : nil
+}
 
 /// Convert SMC bytes to Float.
 /// Apple Silicon uses IEEE 754 little-endian (4 bytes).

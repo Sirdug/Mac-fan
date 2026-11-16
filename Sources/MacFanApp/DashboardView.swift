@@ -86,11 +86,11 @@ struct DashboardView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
 
-            MiniGraph(values: history, color: color, fixedMaximum: 1)
-                .frame(height: 25)
+            MiniGraph(values: history, color: color, fixedMaximum: 1, capacity: state.historyLimit)
+                .frame(height: 28)
         }
         .padding(9)
-        .frame(maxWidth: .infinity, minHeight: 102, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 105, alignment: .topLeading)
         .background {
             RoundedRectangle(cornerRadius: 12)
                 .fill(color.opacity(0.055))
@@ -124,7 +124,7 @@ struct DashboardView: View {
                     title: "WALL",
                     icon: "powerplug.fill",
                     value: metrics.adapterConnected ? watts(metrics.wallPowerW) : "—",
-                    subtitle: metrics.adapterConnected ? "AC input" : "Unplugged",
+                    subtitle: metrics.adapterConnected ? "Estimated AC" : "Unplugged",
                     color: .green
                 )
                 powerDivider
@@ -133,15 +133,16 @@ struct DashboardView: View {
                     icon: batteryIcon,
                     value: batteryWatts,
                     subtitle: batterySubtitle,
-                    color: metrics.isCharging ? .green : .blue
+                    color: batteryColor
                 )
+                .help("Positive (+) watts charge the battery. Negative (−) watts are drawn from the battery.")
             }
 
             batteryEstimate
 
             HStack(spacing: 7) {
-                MiniGraph(values: state.powerHistory, color: .orange, fixedMaximum: nil)
-                    .frame(height: 27)
+                MiniGraph(values: state.powerHistory, color: .orange, fixedMaximum: nil, capacity: state.historyLimit)
+                    .frame(height: 30)
                 VStack(alignment: .trailing, spacing: 1) {
                     Text("POWER HISTORY")
                         .font(.system(size: 7, weight: .bold))
@@ -158,43 +159,35 @@ struct DashboardView: View {
                 .fill(Color.orange.opacity(0.035))
         }
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
-        .help("Whole-Mac, wall, and battery values use Apple battery-controller telemetry. The system value is cross-checked against Apple's CPU + GPU + ANE powermetrics estimate when the updated helper is installed. These remain estimates, not utility-grade measurements.")
+        .help("System and battery watts prefer live, read-only SMC sensors, with battery-controller fallbacks. Wall watts estimate AC consumption from the controller’s adapter input and loss channels and can update more slowly. Battery time uses macOS’s estimate when available; recent usage is an approximate fallback. Actual runtime depends on workload.")
     }
 
     private var batteryEstimate: some View {
         HStack(spacing: 6) {
-            Image(systemName: metrics.batteryEstimateIsQuick
-                  ? "bolt.fill"
-                  : (metrics.isCharging ? "clock.badge.checkmark" : "clock"))
+            Image(systemName: metrics.isCharging ? "clock.badge.checkmark" : "clock")
                 .font(.system(size: 9, weight: .semibold))
             VStack(alignment: .leading, spacing: 2) {
                 Text(batteryEstimateText)
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
-                if metrics.batteryEstimateIsQuick {
-                    HStack(spacing: 4) {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .scaleEffect(0.55)
-                            .frame(width: 8, height: 8)
-                        Text("Working on a better estimate…")
-                            .font(.system(size: 8, weight: .medium, design: .rounded))
-                            .foregroundStyle(.secondary)
-                    }
+                if let source = metrics.batteryEstimateSource {
+                    Text(source.rawValue)
+                        .font(.system(size: 8, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
                 }
             }
             Spacer()
             if let percent = metrics.batteryPercent {
                 ProgressView(value: Double(percent), total: 100)
                     .progressViewStyle(.linear)
-                    .tint(metrics.isCharging ? .green : .blue)
+                    .tint(batteryColor)
                     .frame(width: 78)
             }
         }
-        .foregroundStyle(metrics.isCharging ? Color.green : Color.blue)
+        .foregroundStyle(batteryColor)
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(
-            (metrics.isCharging ? Color.green : Color.blue).opacity(0.09),
+            batteryColor.opacity(0.09),
             in: RoundedRectangle(cornerRadius: 10)
         )
     }
@@ -213,6 +206,8 @@ struct DashboardView: View {
             Text(value)
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
                 .contentTransition(.numericText())
             Text(subtitle)
                 .font(.system(size: 8))
@@ -243,7 +238,7 @@ struct DashboardView: View {
 
     private var batteryIcon: String {
         guard let percent = metrics.batteryPercent else { return "battery.0percent" }
-        if metrics.isCharging { return "battery.100percent.bolt" }
+        if batteryFlow == .charging { return "battery.100percent.bolt" }
         switch percent {
         case 76...: return "battery.100percent"
         case 51...: return "battery.75percent"
@@ -253,32 +248,57 @@ struct DashboardView: View {
         }
     }
 
+    private enum BatteryFlow: String {
+        case charging = "Charging"
+        case discharging = "Discharging"
+        case idle = "Idle"
+        case unavailable = "Unavailable"
+    }
+
+    private var batteryFlow: BatteryFlow {
+        guard let power = metrics.batteryPowerW, power.isFinite else { return .unavailable }
+        // Use measured flow even when the controller's charging flag lags.
+        if power > 0.2 { return .charging }
+        if power < -0.2 { return .discharging }
+        return .idle
+    }
+
+    private var batteryColor: Color {
+        switch batteryFlow {
+        case .charging: return .green
+        case .discharging: return .blue
+        case .idle, .unavailable: return .secondary
+        }
+    }
+
     private var batteryWatts: String {
-        guard let value = metrics.batteryPowerW else { return "—" }
-        return String(format: "%.1f W", abs(value))
+        guard let value = metrics.batteryPowerW, value.isFinite else { return "—" }
+        let sign: String
+        switch batteryFlow {
+        case .charging: sign = "+"
+        case .discharging: sign = "−"
+        case .idle, .unavailable: sign = ""
+        }
+        return sign + String(format: "%.1f W", abs(value))
     }
 
     private var systemPowerSubtitle: String {
-        guard let chipPower = metrics.chipPowerW else { return "Estimated total" }
-        return String(format: "SoC %.1f W", chipPower)
+        metrics.systemPowerSource.rawValue
     }
 
     private var batterySubtitle: String {
         let percent = metrics.batteryPercent.map { "\($0)%" } ?? ""
-        if metrics.isCharging { return percent.isEmpty ? "Charging" : "\(percent) · charging" }
-        if let power = metrics.batteryPowerW, power < -0.2 {
-            return percent.isEmpty ? "Discharging" : "\(percent) · battery"
-        }
-        return percent.isEmpty ? "Idle" : "\(percent) · idle"
+        let flow = batteryFlow.rawValue
+        return percent.isEmpty ? flow : "\(percent) · \(flow.lowercased())"
     }
 
     private var batteryEstimateText: String {
-        if metrics.isFullyCharged { return "Battery fully charged" }
+        if metrics.adapterConnected && metrics.isFullyCharged { return "Battery fully charged" }
         if let minutes = metrics.batteryTimeMinutes {
             let estimate = metrics.isCharging
-                ? "Full in \(formatDuration(minutes))"
-                : "\(formatDuration(minutes)) remaining"
-            return metrics.batteryEstimateIsQuick ? "Quick estimate · \(estimate)" : estimate
+                ? "Full in about \(formatDuration(minutes))"
+                : "About \(formatDuration(minutes)) remaining"
+            return estimate
         }
         if metrics.isCharging { return "Calculating time to full…" }
         if metrics.adapterConnected { return "Connected · not charging" }
@@ -300,50 +320,5 @@ struct DashboardView: View {
     private func watts(_ value: Double?) -> String {
         guard let value else { return "—" }
         return String(format: "%.1f W", max(0, value))
-    }
-}
-
-struct MiniGraph: View {
-    let values: [Double]
-    let color: Color
-    let fixedMaximum: Double?
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                graphPath(in: geometry.size, closeBottom: true)
-                    .fill(LinearGradient(
-                        colors: [color.opacity(0.28), color.opacity(0.015)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ))
-                graphPath(in: geometry.size, closeBottom: false)
-                    .stroke(color.opacity(0.9), style: StrokeStyle(lineWidth: 1.4, lineCap: .round, lineJoin: .round))
-            }
-        }
-        .accessibilityHidden(true)
-    }
-
-    private func graphPath(in size: CGSize, closeBottom: Bool) -> Path {
-        var path = Path()
-        guard !values.isEmpty, size.width > 0, size.height > 0 else { return path }
-        let maximum = max(fixedMaximum ?? ((values.max() ?? 1) * 1.15), 0.001)
-        let step = values.count > 1 ? size.width / CGFloat(values.count - 1) : size.width
-
-        for (index, rawValue) in values.enumerated() {
-            let value = min(max(rawValue / maximum, 0), 1)
-            let point = CGPoint(
-                x: CGFloat(index) * step,
-                y: size.height - CGFloat(value) * size.height
-            )
-            if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
-        }
-
-        if closeBottom {
-            path.addLine(to: CGPoint(x: size.width, y: size.height))
-            path.addLine(to: CGPoint(x: 0, y: size.height))
-            path.closeSubpath()
-        }
-        return path
     }
 }

@@ -11,6 +11,8 @@ import SwiftUI
 
 struct PanelView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var updates: UpdateService
+    @EnvironmentObject var fanHelper: FanHelper
 
     var body: some View {
         // Capped height + scroll: the full panel can outgrow the screen
@@ -37,6 +39,13 @@ struct PanelView: View {
 
                 if !state.daemonUp {
                     daemonWarning
+                } else if fanHelper.status == .outdated {
+                    helperOutdatedBanner
+                } else if let error = state.controlError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                        .padding(10)
                 }
 
                 sectionLabel("Live Monitor")
@@ -97,13 +106,54 @@ struct PanelView: View {
             Label("Fan daemon not running", systemImage: "exclamationmark.triangle.fill")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.yellow)
-            Text("Run setup.sh in the Mac-fan folder to install it.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            if fanHelper.status == .unknown {
+                Text("Run setup.sh in the Mac-fan folder to install it.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(fanHelper.status == .notInstalled
+                     ? "Mac Fan needs its fan helper to read and control the fans."
+                     : "The fan helper is installed but isn't responding. Reinstalling it usually fixes this.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                helperButton(fanHelper.status == .notInstalled ? "Install Fan Helper" : "Reinstall Fan Helper")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var helperOutdatedBanner: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Fan helper update ready", systemImage: "arrow.down.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.blue)
+            Text("This version of Mac Fan comes with a newer fan helper. Installing it asks for your password.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            helperButton("Update Fan Helper")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func helperButton(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            Button(title) { fanHelper.install() }
+                .buttonStyle(.glassProminent)
+                .controlSize(.small)
+                .disabled(fanHelper.installing)
+            if fanHelper.installing {
+                ProgressView().controlSize(.small)
+            } else if let error = fanHelper.error {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.top, 2)
     }
 
     // MARK: - Fans
@@ -376,6 +426,8 @@ struct PanelView: View {
             Toggle("Launch at Login", isOn: $state.launchAtLogin)
                 .toggleStyle(.checkbox)
                 .font(.system(size: 12))
+            UpdatesSection()
+                .padding(.top, 4)
             Button("Quit Mac Fan") {
                 NSApp.terminate(nil)
             }

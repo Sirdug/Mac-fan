@@ -59,5 +59,58 @@ import Testing
         #expect(snapshot.cpuUsage == nil)
         #expect(snapshot.gpuUsage == nil)
         #expect(snapshot.combinedPowerW == nil)
+        #expect(snapshot.perCoreClusters == nil)
+    }
+
+    @Test(arguments: [8, 10]) func m1ProCoreIDsAndOlderPowerFormat(coreCount: Int) throws {
+        let secondPerformanceCluster = 2 + (coreCount - 2) / 2
+        let clusters: [[String: Any]] = [
+            ["name": "E-Cluster", "freq_hz": 2_064_000_000.0,
+             "cpus": (0..<2).map { ["cpu": $0, "freq_hz": 2_064_000_000.0, "idle_ratio": 0.75] }],
+            ["name": "P0-Cluster", "freq_hz": 3_228_000_000.0,
+             "cpus": (2..<secondPerformanceCluster).map { ["cpu": $0, "freq_hz": 3_228_000_000.0, "idle_ratio": 0.5] }],
+            ["name": "P1-Cluster", "freq_hz": 3_228_000_000.0,
+             "cpus": (secondPerformanceCluster..<coreCount).map { ["cpu": $0, "freq_hz": 3_228_000_000.0, "idle_ratio": 0.5] }],
+        ]
+        let sample: [String: Any] = [
+            "is_delta": true, "elapsed_ns": 500_000_000,
+            "processor": ["clusters": clusters, "cpu_energy": 6_000,
+                          "gpu_energy": 2_000, "ane_energy": 250],
+            "gpu": ["freq_hz": 1_296, "idle_ratio": 0.25],
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: sample, format: .xml, options: 0)
+        let snapshot = try PerformanceSnapshot.parsePowermetricsPlist(data)
+        #expect(snapshot.perCoreMHz.count == coreCount)
+        #expect(snapshot.perCoreClusters?["0"] == "E-Cluster")
+        #expect(snapshot.perCoreClusters?["2"] == "P0-Cluster")
+        #expect(snapshot.perCoreClusters?["\(coreCount - 1)"] == "P1-Cluster")
+        #expect(snapshot.gpuMHz == 1_296)
+        #expect(snapshot.cpuPowerW == 12)
+        #expect(snapshot.gpuPowerW == 4)
+        #expect(snapshot.anePowerW == 0.5)
+        #expect(snapshot.combinedPowerW == 16.5)
+    }
+
+    @Test func binaryPlistAndGPUOnlyEnergyFallback() throws {
+        let sample: [String: Any] = ["elapsed_ns": 250_000_000,
+                                     "gpu": ["gpu_energy": 500, "freq_hz": 900, "idle_ratio": 0.5]]
+        let data = try PropertyListSerialization.data(fromPropertyList: sample, format: .binary, options: 0)
+        let snapshot = try PerformanceSnapshot.parsePowermetricsPlist(data)
+        #expect(snapshot.gpuPowerW == 2)
+        #expect(snapshot.gpuMHz == 900)
+    }
+
+    @Test func invalidSampleDoesNotBecomeZeroTelemetry() throws {
+        let sample: [String: Any] = ["invalid": true, "processor": ["cpu_power": 0]]
+        let data = try PropertyListSerialization.data(fromPropertyList: sample, format: .xml, options: 0)
+        #expect(throws: PowermetricsParseError.self) { try PerformanceSnapshot.parsePowermetricsPlist(data) }
+    }
+
+    @Test func efficiencyPerformanceAndSuperBadges() {
+        #expect(CPUClusterKind(clusterName: "E-Cluster").badge == "E")
+        #expect(CPUClusterKind(clusterName: "E0-Cluster").badge == "E")
+        #expect(CPUClusterKind(clusterName: "P1-Cluster").badge == "P")
+        #expect(CPUClusterKind(clusterName: "Super").badge == "S")
+        #expect(CPUClusterKind(clusterName: "Core").badge == "—")
     }
 }

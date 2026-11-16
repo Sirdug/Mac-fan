@@ -87,6 +87,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.resizePopover(for: detail)
             }
 
+        // Updates restart the app only while nothing of it is on screen.
+        state.updates.isQuiet = { [weak self] in
+            guard let self else { return true }
+            return !self.popover.isShown && self.curveWindow == nil
+        }
+        state.updates.start()
+        state.fanHelper.refresh()
+        // A new version can bring a new fan daemon, which needs the admin password.
+        // Ask once, right after the update, instead of waiting for someone to notice.
+        if state.updates.consumeJustUpdated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let helper = self?.state.fanHelper, helper.status == .outdated else { return }
+                helper.install()
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -102,7 +117,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let button = statusItem.button {
             normalPopoverSize = nil
             popover.contentViewController = NSHostingController(
-                rootView: PanelView().environmentObject(state))
+                rootView: PanelView()
+                    .environmentObject(state)
+                    .environmentObject(state.updates)
+                    .environmentObject(state.fanHelper))
+            state.fanHelper.refresh()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             normalPopoverSize = popover.contentSize
             popover.contentViewController?.view.window?.makeKey()
